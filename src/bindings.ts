@@ -221,11 +221,11 @@ export const enum FdFlags {
   Sync = 1 << 4
 }
 
-interface In {
+export interface In {
   read(len: number): Uint8Array | Promise<Uint8Array>;
 }
 
-interface Out {
+export interface Out {
   write(data: Uint8Array): void | Promise<void>;
 }
 
@@ -312,7 +312,7 @@ export default class Bindings {
     stderr = lineOut(console.error),
     args = [],
     env = {},
-    abortSignal,
+    abortSignal
   }: {
     openFiles: OpenFiles;
     stdin?: In;
@@ -657,9 +657,8 @@ export default class Bindings {
             this._getBuffer(),
             subscriptionPtr
           );
-          subscriptionPtr = (subscriptionPtr + subscription_t.size) as ptr<
-            subscription_t
-          >;
+          subscriptionPtr = (subscriptionPtr +
+            subscription_t.size) as ptr<subscription_t>;
           switch (union.tag) {
             case EventType.Clock: {
               let timeout = Number(union.data.timeout) / 1_000_000;

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 import { IDisposable } from 'xterm';
-import Bindings, { OpenFlags, stringOut } from './bindings.js';
+import Bindings, { In, OpenFlags, Out, stringOut } from './bindings.js';
 import { FileOrDir, OpenFiles } from './fileSystem.js';
+import Pipe from './pipe.js';
 
 declare const Terminal: typeof import('xterm').Terminal;
 declare const LocalEchoController: any;
@@ -48,7 +49,8 @@ try {
       }
     });
   }
-} catch {
+} catch (err) {
+  console.log(err);
   hasSupport = false;
 }
 
@@ -197,6 +199,40 @@ try {
 
   let pwd = '/sandbox';
 
+  function createExec({
+    args,
+    abortController,
+    stdin,
+    stdout,
+    stderr,
+    openFiles,
+    onFinally
+  }: ExecParams): () => Promise<void> {
+    return async () => {
+      try {
+        let statusCode = await new Bindings({
+          abortSignal: abortController.signal,
+          openFiles,
+          stdin,
+          stdout,
+          stderr,
+          args: ['$', ...args],
+          env: {
+            RUST_BACKTRACE: '1',
+            PWD: pwd
+          }
+        }).run(await module);
+        if (statusCode !== 0) {
+          term.writeln(`Exit code: ${statusCode}`);
+        }
+      } finally {
+        if (onFinally !== null) {
+          await onFinally();
+        }
+      }
+    };
+  }
+
   while (true) {
     let line: string = await localEcho.read(`${pwd}$ `);
     localEcho.history.rewind();
@@ -254,24 +290,29 @@ try {
         }
       }
       let openFiles = new OpenFiles(preOpens);
-      let redirectedStdout;
-      if (['>', '>>'].includes(args[args.length - 2])) {
-        let path = args.pop()!;
-        // Resolve against the current working dir.
-        path = new URL(path, `file://${pwd}/`).pathname;
-        let { preOpen, relativePath } = openFiles.findRelPath(path);
-        let handle = await preOpen.getFileOrDir(
-          relativePath,
-          FileOrDir.File,
-          OpenFlags.Create
-        );
-        if (args.pop() === '>') {
-          redirectedStdout = await handle.createWritable();
-        } else {
-          redirectedStdout = await handle.createWritable({ keepExistingData: true });
-          redirectedStdout.seek((await handle.getFile()).size);
+
+      const subcommands = [];
+      let startIndex = 0;
+      let lastPipeIndex = -1;
+      for (const [index, arg] of args.entries()) {
+        if (arg === '|') {
+          const subcommand = args.slice(startIndex, index);
+          if (subcommand.length === 0) {
+            term.writeln('Error: pipe arguments with no args between them.');
+            continue;
+          }
+          subcommands.push(subcommand);
+          startIndex = index + 1;
+          lastPipeIndex = index;
         }
       }
+      if (lastPipeIndex !== args.length - 1) {
+        subcommands.push(args.slice(lastPipeIndex + 1));
+      } else {
+        term.writeln('Error: command should not end with a pipe.');
+        continue;
+      }
+
       localEcho.detach();
       let abortController = new AbortController();
       let ctrlCHandler = term.onData(s => {
@@ -280,31 +321,82 @@ try {
           abortController.abort();
         }
       });
-      try {
-        let statusCode = await new Bindings({
-          abortSignal: abortController.signal,
-          openFiles,
-          stdin,
-          stdout: redirectedStdout ?? stdout,
-          stderr: stdout,
-          args: ['$', ...args],
-          env: {
-            RUST_BACKTRACE: '1',
-            PWD: pwd
+
+      let lastPipe: Pipe | null = null;
+      const execs: Array<() => Promise<void>> = [];
+      for (const [index, subArgs] of subcommands.entries()) {
+        const _stdin = index === 0 ? stdin : lastPipe!;
+
+        const hasNextCommand = index < subcommands.length - 1;
+        let _stdout;
+        let _onFinally: (() => Promise<void>) | null = null;
+
+        if (hasNextCommand) {
+          const pipe = new Pipe();
+          _stdout = pipe;
+          _onFinally = () => pipe.close();
+          lastPipe = pipe;
+        } else {
+          let redirectedStdout: FileSystemWritableFileStream | null = null;
+
+          if (['>', '>>'].includes(subArgs[subArgs.length - 2])) {
+            let path = subArgs.pop()!;
+            // Resolve against the current working dir.
+            path = new URL(path, `file://${pwd}/`).pathname;
+            let { preOpen, relativePath } = openFiles.findRelPath(path);
+            let handle = await preOpen.getFileOrDir(
+              relativePath,
+              FileOrDir.File,
+              OpenFlags.Create
+            );
+            if (subArgs.pop() === '>') {
+              redirectedStdout = await handle.createWritable();
+            } else {
+              redirectedStdout = await handle.createWritable({
+                keepExistingData: true
+              });
+              redirectedStdout.seek((await handle.getFile()).size);
+            }
+
+            _stdout = redirectedStdout;
+            _onFinally = () => redirectedStdout?.close() ?? Promise.resolve();
+          } else {
+            _stdout = stdout;
+            _onFinally = null;
           }
-        }).run(await module);
-        if (statusCode !== 0) {
-          term.writeln(`Exit code: ${statusCode}`);
         }
+
+        execs.push(
+          createExec({
+            args: subArgs,
+            abortController,
+            stdin: _stdin,
+            stdout: _stdout,
+            stderr: stdout,
+            openFiles,
+            onFinally: _onFinally
+          })
+        );
+      }
+
+      try {
+        await Promise.all(execs.map(f => f()));
       } finally {
         ctrlCHandler.dispose();
         localEcho.attach();
-        if (redirectedStdout) {
-          await redirectedStdout.close();
-        }
       }
     } catch (err) {
       term.writeln(err.message);
     }
   }
 })();
+
+type ExecParams = {
+  args: Array<string>;
+  abortController: AbortController;
+  stdin: In;
+  stdout: Out;
+  stderr: Out;
+  openFiles: OpenFiles;
+  onFinally: (() => Promise<void>) | null;
+};
